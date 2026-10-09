@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Udhaar Khata</title>
+<meta name="description" content="A private personal-finance ledger: loans to friends with reasons, spending, budgets, savings goals, net worth and monthly reports.">
+<meta name="theme-color" content="#1f4aa8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1519" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <div id="app"></div>
+</div>
+<div id="sheet" class="sheet" hidden></div>
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<noscript>Udhaar Khata needs JavaScript to run.</noscript>
+<script src="app.js"></script>
+</body>
+</html>
