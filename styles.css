@@ -337,3 +337,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: no-preference) {
   .meter > span { transition: width 0.3s ease; }
 }
+
+/* sync forms */
+label.chk { display: flex; gap: 10px; align-items: center; margin-top: 12px; font-weight: 400; }
+label.chk input { width: auto; margin: 0; }

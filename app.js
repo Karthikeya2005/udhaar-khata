@@ -72,7 +72,8 @@
   }
 
   /* ================= state and storage ================= */
-  var docs = [], mode = 'pending', col = null, ready = false, dl = null;
+  var docs = [], mode = 'pending', ready = false, dl = null;
+  var cloud = null, cu = null, ckey = null, cmeta = null, cstate = 'off', cerr = '', unsub = null, listenSeq = 0, appliedSeq = 0;
   var ui = { tab: 'home', last: 'home', fview: 'home', fkey: null, ffilter: 'all', mfilter: 'all', month: thisMonth(), q: '', confirm: null, refocus: null };
   var lastFocus = null, armTimer = null, chain = Promise.resolve(), busy = {};
   var lock = { rec: null, locked: false, fails: 0, until: 0 };
@@ -98,7 +99,7 @@
   function putDoc(d) {
     var body = JSON.parse(JSON.stringify(d));
     var id = body.id; delete body.id;
-    if (mode === 'cloud') return col.doc(id).set(body);
+    if (mode === 'cloud') return cloudPut(id, body);
     var i = docs.findIndex(function (x) { return x.id === id; });
     var full = Object.assign({ id: id }, body);
     if (i >= 0) docs[i] = full; else docs.push(full);
@@ -106,7 +107,7 @@
     return Promise.resolve();
   }
   function removeDoc(id) {
-    if (mode === 'cloud') return col.doc(id).delete();
+    if (mode === 'cloud') return cu && cloud.remove(cu.uid, id);
     docs = docs.filter(function (x) { return x.id !== id; });
     saveLocal(); render();
     return Promise.resolve();
@@ -117,7 +118,7 @@
     busy[key] = true;
     persist(fn).then(function () { delete busy[key]; });
   }
-  function fallbackLocal() { mode = 'local'; col = null; loadLocal(); ready = true; render(); }
+  function fallbackLocal() { mode = 'local'; loadLocal(); ready = true; render(); }
 
   async function init() {
     loadPin();
@@ -127,24 +128,196 @@
     }
     if (lock.rec) lock.locked = true;
     render();
-    var db = null, uid = null;
+    fallbackLocal();
+    try { cloud = await Promise.race([window.khataCloudP || Promise.resolve(null), new Promise(function (r) { setTimeout(function () { r(null); }, 8000); })]); } catch (e) { cloud = null; }
+    if (cloud) { cstate = 'out'; cloud.onAuth(onUser); render(); }
+  }
+
+  /* ================= cloud sync (Firebase, optional) ================= */
+  var SYNC_ITERS = 200000, CK = 'udhaar-khata.ck.', META = 'udhaar-khata.meta.', UPLOADED = 'udhaar-khata.up.';
+  function lget(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lset(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function ldel(k) { try { localStorage.removeItem(k); } catch (e) {} }
+  async function deriveSyncKey(pass, saltB64) {
+    var base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: unb64(saltB64), iterations: SYNC_ITERS, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  }
+  async function sealWith(key, text) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(text));
+    return { v: 1, iv: b64(iv), ct: b64(ct) };
+  }
+  async function unsealWith(key, o) {
+    var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(o.iv) }, key, unb64(o.ct));
+    return new TextDecoder().decode(pt);
+  }
+  async function keyMatches(key, meta) {
+    try { return (await unsealWith(key, meta.check)) === 'udhaar-khata'; } catch (e) { return false; }
+  }
+  async function rememberedKey(uid) {
     try {
-      if (window.claude && window.claude.use) {
-        var r = await Promise.all([window.claude.use('db'), window.claude.use('user'), window.claude.use('downloads')]);
-        db = r[0]; dl = r[2] || null;
-        uid = r[1] ? await r[1].id() : null;
+      var j = lget(CK + uid);
+      return j ? await crypto.subtle.importKey('jwk', JSON.parse(j), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']) : null;
+    } catch (e) { return null; }
+  }
+  async function rememberKey(uid, key) { try { lset(CK + uid, JSON.stringify(await crypto.subtle.exportKey('jwk', key))); } catch (e) {} }
+  async function cloudPut(id, body) {
+    if (!cu) throw new Error('not signed in');
+    return cloud.set(cu.uid, id, ckey ? await sealWith(ckey, JSON.stringify(body)) : body);
+  }
+  function localDocs() { try { return arr(JSON.parse(lget(KEY2) || '[]')); } catch (e) { return []; } }
+  function stopListen() { if (unsub) { try { unsub(); } catch (e) {} unsub = null; } listenSeq++; }
+  function goLocal() { stopListen(); mode = 'local'; loadLocal(); ready = true; render(); }
+
+  async function onUser(u) {
+    stopListen();
+    cu = u; cerr = '';
+    if (!u) { ckey = null; cmeta = null; cstate = 'out'; goLocal(); return; }
+    cstate = 'locked'; render();
+    try { cmeta = await cloud.getMeta(u.uid); if (cmeta) lset(META + u.uid, JSON.stringify(cmeta)); }
+    catch (e) { var c = lget(META + u.uid); cmeta = c ? JSON.parse(c) : undefined; }
+    if (cmeta === undefined) { cstate = 'error'; cerr = 'Could not reach your account. Showing this device’s copy.'; render(); return; }
+    if (!cmeta) { openSetupSync(); return; }
+    if (cmeta.enc === false) { ckey = null; startListen(); return; }
+    var k = await rememberedKey(u.uid);
+    if (k && await keyMatches(k, cmeta)) { ckey = k; startListen(); return; }
+    openUnlockSync();
+  }
+  function startListen() {
+    var my = ++listenSeq;
+    cstate = 'on'; mode = 'cloud'; ready = false; render();
+    unsub = cloud.listen(cu.uid, async function (items, fromCache) {
+      var out = [], bad = 0;
+      for (var i = 0; i < items.length; i++) {
+        try {
+          var d = items[i].data;
+          if (d && d.ct) { if (!ckey) throw new Error('locked'); d = JSON.parse(await unsealWith(ckey, d)); }
+          out.push(Object.assign({}, d, { id: items[i].id }));
+        } catch (e) { bad++; }
       }
-    } catch (e) { db = null; }
-    if (db && uid) {
-      mode = 'cloud';
-      col = db.collection('data/users/' + uid);
-      col.onSnapshot(function (snap) {
-        docs = snap.docs.map(function (d) { return Object.assign({}, d.data(), { id: d.id }); });
-        ready = true; render();
-      }, function () { toast('Lost the connection to your saved ledger.'); fallbackLocal(); });
-    } else {
-      fallbackLocal();
-    }
+      if (my !== listenSeq || my < appliedSeq) return;
+      appliedSeq = my;
+      docs = out; ready = true; render();
+      if (bad) toast(plural(bad, 'entry') + ' could not be opened. Wrong passphrase?');
+      if (!fromCache && !items.length) offerUpload();
+    }, function () {
+      if (my !== listenSeq) return;
+      cstate = 'error'; cerr = 'Lost the connection to your account. Showing this device’s copy.';
+      toast('Lost the connection to your saved ledger.'); goLocal();
+    });
+  }
+  function offerUpload() {
+    var n = localDocs().length;
+    if (!n || !cu || lget(UPLOADED + cu.uid)) return;
+    lset(UPLOADED + cu.uid, '1');
+    openSheet('<h2 id="sheet-title">Upload this device’s entries?</h2><p class="hint">Your account is empty and this device has ' + plural(n, 'entry') + '. Upload them so your other devices can see them too. The copy on this device stays as it is.</p>' +
+      '<div class="actions"><button type="button" class="btn" data-act="close-sheet">Not now</button><button type="button" class="btn btn-primary" data-act="cloud-upload">Upload</button></div>');
+  }
+  function uploadLocal() {
+    var have = {}; docs.forEach(function (d) { have[d.id] = 1; });
+    var todo = localDocs().filter(function (d) { return d && d.id && !have[d.id]; });
+    closeSheet();
+    if (mode !== 'cloud') { toast('Sign in and unlock sync first.'); return; }
+    if (!todo.length) { toast('Nothing new to upload.'); return; }
+    persist(async function () {
+      for (var i = 0; i < todo.length; i++) await putDoc(todo[i]);
+      toast('Uploaded ' + plural(todo.length, 'entry'));
+    });
+  }
+  function openSetupSync() {
+    openSheet('<form id="sync-form" novalidate><h2 id="sheet-title">Set up cloud sync</h2>' +
+      '<p class="hint">Choose a sync passphrase. Your entries are locked with it on this device before they are uploaded, so only you can read them. If you forget it, the cloud copy cannot be recovered, so keep a backup file too.</p>' +
+      '<label for="sy-p1">Sync passphrase (at least 8 characters)</label><input id="sy-p1" type="password" autocomplete="new-password" maxlength="64">' +
+      '<label for="sy-p2">Type it again</label><input id="sy-p2" type="password" autocomplete="new-password" maxlength="64">' +
+      '<label class="chk"><input id="sy-rem" type="checkbox" checked> Remember it on this device</label>' +
+      '<label class="chk"><input id="sy-plain" type="checkbox"> Do not lock my entries (not recommended)</label>' +
+      '<p id="sy-err" class="err" role="alert" hidden></p>' +
+      '<div class="actions"><button type="button" class="btn" data-act="close-sheet">Later</button><button type="submit" class="btn btn-primary">Turn on sync</button></div></form>', function (sh) {
+      var err = $('#sy-err', sh), fail = function (m) { err.textContent = m; err.hidden = false; };
+      $('#sync-form', sh).addEventListener('submit', async function (ev) {
+        ev.preventDefault();
+        var plain = $('#sy-plain', sh).checked, p1 = $('#sy-p1', sh).value, p2 = $('#sy-p2', sh).value;
+        try {
+          var meta;
+          if (plain) { meta = { v: 1, enc: false }; ckey = null; }
+          else {
+            if (p1.length < 8) return fail('Use at least 8 characters.');
+            if (p1 !== p2) return fail('The two passphrases do not match.');
+            var salt = b64(crypto.getRandomValues(new Uint8Array(16)));
+            var key = await deriveSyncKey(p1, salt);
+            meta = { v: 1, enc: true, salt: salt, iters: SYNC_ITERS, check: await sealWith(key, 'udhaar-khata') };
+            ckey = key;
+            if ($('#sy-rem', sh).checked) await rememberKey(cu.uid, key);
+          }
+          await cloud.setMeta(cu.uid, meta); cmeta = meta; lset(META + cu.uid, JSON.stringify(meta));
+          closeSheet(); startListen();
+        } catch (e) { console.error(e); fail('Could not set up sync. Check your connection and try again.'); }
+      });
+    });
+  }
+  function openUnlockSync() {
+    openSheet('<form id="sync-form" novalidate><h2 id="sheet-title">Unlock cloud sync</h2>' +
+      '<p class="hint">Enter your sync passphrase to open your entries.</p>' +
+      '<label for="sy-p1">Sync passphrase</label><input id="sy-p1" type="password" autocomplete="current-password" maxlength="64">' +
+      '<label class="chk"><input id="sy-rem" type="checkbox" checked> Remember it on this device</label>' +
+      '<p id="sy-err" class="err" role="alert" hidden></p>' +
+      '<div class="actions"><button type="button" class="btn" data-act="close-sheet">Later</button><button type="submit" class="btn btn-primary">Unlock</button></div></form>', function (sh) {
+      var err = $('#sy-err', sh), fail = function (m) { err.textContent = m; err.hidden = false; };
+      $('#sync-form', sh).addEventListener('submit', async function (ev) {
+        ev.preventDefault();
+        var pw = $('#sy-p1', sh).value;
+        if (!pw) return fail('Enter your passphrase.');
+        try {
+          var key = await deriveSyncKey(pw, cmeta.salt);
+          if (!await keyMatches(key, cmeta)) return fail('That passphrase is not right.');
+          ckey = key;
+          if ($('#sy-rem', sh).checked) await rememberKey(cu.uid, key);
+          closeSheet(); startListen();
+        } catch (e) { console.error(e); fail('Could not unlock. Try again.'); }
+      });
+    });
+  }
+  function cloudSignIn() {
+    if (!cloud) return;
+    cloud.signIn().catch(function (e) {
+      if (e && (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request')) return;
+      console.error(e); toast('Sign-in failed. Check that this site is allowed in Firebase.');
+    });
+  }
+  function cloudSignOut() {
+    if (cu) ldel(CK + cu.uid);
+    ckey = null;
+    cloud.signOut().catch(function () {});
+  }
+  function syncHTML() {
+    var b = function (act, label, primary) { return '<button class="btn' + (primary ? ' btn-primary' : '') + '" type="button" data-act="' + act + '">' + label + '</button>'; };
+    var body;
+    if (!cloud) body = '<p class="note-p muted">Cloud sync is not set up in this build. Add your Firebase config to turn it on. See docs/FIREBASE_SETUP.md.</p>';
+    else if (!cu) body = '<p class="note-p">Sign in with Google to keep the same ledger on your phone and computer. Your entries are locked with a passphrase on your device before upload.</p><div class="acts">' + b('cloud-signin', 'Sign in with Google', true) + '</div>';
+    else if (cstate === 'on') body = '<p class="note-p">Signed in as <b>' + esc(cu.email || cu.name) + '</b>. ' + (ckey ? 'Entries are locked with your passphrase before upload.' : 'Entries are uploaded without a passphrase lock.') + '</p><div class="acts">' + b('cloud-upload', 'Upload this device’s entries') + b('cloud-signout', 'Sign out') + '</div>';
+    else if (cstate === 'locked') body = '<p class="note-p">Signed in as <b>' + esc(cu.email || cu.name) + '</b>. Sync is waiting for your passphrase. Until then, new entries are saved on this device only.</p><div class="acts">' + b(cmeta ? 'cloud-unlock' : 'cloud-setup', cmeta ? 'Unlock sync' : 'Set up sync', true) + b('cloud-signout', 'Sign out') + '</div>';
+    else body = '<p class="note-p">' + esc(cerr || 'Sync is not working right now.') + '</p><div class="acts">' + b('cloud-signout', 'Sign out') + '</div>';
+    return section('Cloud sync (beta)', body);
+  }
+
+  /* ---- export ---- */
+  function csvCell(v) { v = String(v == null ? '' : v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+  function exportCSV() {
+    var S = derive(), rows = [];
+    S.loans.forEach(function (l) {
+      var c = calc(l);
+      rows.push([l.lent, l.dir === 'borrowed' ? 'Borrowed' : 'Lent', l.friend, '', l.reason, l.amount, c.paid, c.bal, l.due || '', l.method || '']);
+    });
+    S.txns.forEach(function (t) { rows.push([t.date, t.type === 'income' ? 'Income' : 'Expense', '', t.cat || '', t.note || '', t.amount, '', '', '', t.method || '']); });
+    rows.sort(function (a, b) { return String(b[0]).localeCompare(String(a[0])); });
+    rows.unshift(['Date', 'Type', 'Friend', 'Category', 'Note or reason', 'Amount', 'Repaid', 'Balance', 'Due', 'Method']);
+    var text = '\ufeff' + rows.map(function (r) { return r.map(csvCell).join(','); }).join('\r\n');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+    a.download = 'udhaar-khata-' + todayISO() + '.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+    toast('Exported ' + plural(rows.length - 1, 'row'));
   }
 
   /* ================= domain logic ================= */
@@ -783,8 +956,9 @@
     var samples = docs.some(function (d) { return d.sample; });
     return '<div class="view"><div class="narrow"><div class="sec-h"><h2 class="label">Settings</h2><button class="btn btn-quiet btn-small" type="button" data-act="goto" data-tab="' + ui.last + '">Close</button></div>' +
       section('Security', sec) +
+      syncHTML() +
       section('Backup', '<p class="note-p">' + (mode === 'cloud' ? 'Your entries are saved to your account, private to you.' : 'Your entries are stored in this browser only.') + ' Keep a file copy too. You can lock the file with a password.</p><div class="acts"><button class="btn btn-primary" type="button" data-act="backup">Back up</button><button class="btn" type="button" data-act="restore">Restore</button></div>') +
-      section('Your data', '<p class="note-p">' + plural(docs.length, 'entry') + ' saved.</p>' + (samples ? '<div class="acts"><button class="btn" type="button" data-act="clear-samples">Remove sample data</button></div>' : '')) +
+      section('Your data', '<p class="note-p">' + plural(docs.length, 'entry') + ' saved.</p>' + '<div class="acts"><button class="btn" type="button" data-act="export-csv">Export CSV</button>' + (samples ? '<button class="btn" type="button" data-act="clear-samples">Remove sample data</button>' : '') + '</div>') +
       section('Good to know', '<p class="note-p"><b>Reminders</b> appear on Home when you open the app. A web page cannot send phone notifications.</p>' +
         '<p class="note-p"><b>Fingerprint or face unlock</b> is not available here, so the lock uses a PIN.</p>' +
         '<p class="note-p"><b>The PIN</b> is a screen lock kept on this browser only. It does not encrypt your entries. Backup files can be encrypted with a password.</p>') +
@@ -807,7 +981,7 @@
     app.innerHTML = headerHTML() + tabsHTML() +
       (hasSample ? '<div class="banner"><span>Sample data is showing. None of it is real.</span><button type="button" class="btn btn-quiet btn-small" data-act="clear-samples">Clear sample data</button></div>' : '') +
       view +
-      '<p class="foot">' + (mode === 'cloud' ? 'Saved to your account. Only you can see it.' : (standalone ? 'Saved on this device only. Use Settings, then Back up, to keep a copy.' : 'Saved in this browser only. Open this page while signed in to keep entries across devices.')) + '</p>';
+      '<p class="foot">' + (mode === 'cloud' ? 'Synced to your account' + (ckey ? ' and locked with your passphrase.' : '.') : (standalone ? 'Saved on this device only. Use Settings, then Back up, to keep a copy.' : 'Saved in this browser only. Open this page while signed in to keep entries across devices.')) + '</p>';
     if (ui.tab === 'reports') drawTrend();
     if (ui.refocus) { var el = $(ui.refocus, app); if (el) el.focus(); ui.refocus = null; }
     if (hadQ) { var q = $('#q'); if (q) { q.focus(); try { q.setSelectionRange(pos, pos); } catch (e) {} } }
@@ -1431,6 +1605,12 @@
         docs.filter(function (x) { return x.sample; }).forEach(function (x) { persist(function () { return removeDoc(x.id); }); });
         toast('Sample data cleared');
         break;
+      case 'cloud-signin': cloudSignIn(); break;
+      case 'cloud-signout': cloudSignOut(); break;
+      case 'cloud-unlock': openUnlockSync(); break;
+      case 'cloud-setup': openSetupSync(); break;
+      case 'cloud-upload': uploadLocal(); break;
+      case 'export-csv': exportCSV(); break;
       case 'set-pin': openPinForm('set'); break;
       case 'change-pin': openPinForm('change'); break;
       case 'off-pin': openPinForm('off'); break;

@@ -5,7 +5,7 @@
   "description": "A personal-finance ledger: loans to friends with reasons, spending, budgets, savings goals, net worth and monthly reports.",
   "scripts": {
     "start": "npx --yes serve .",
-    "test": "node tests/e2e.js",
+    "test": "node tests/e2e.js && node tests/sync.js",
     "shots": "node tests/e2e.js --shots"
   },
   "devDependencies": {

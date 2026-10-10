@@ -10,8 +10,19 @@
 // Run:  npm test            (add --shots to refresh the README screenshots in docs/)
 const { chromium } = require('playwright');
 const path = require('path');
+const http = require('http');
+const fs = require('fs');
 
-const URL = 'file://' + path.resolve(__dirname, '..', 'index.html');
+// Serve the folder over http (module scripts do not load from file://).
+const ROOT = path.resolve(__dirname, '..');
+const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.webmanifest': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const server = http.createServer((req, res) => {
+  const p = path.join(ROOT, decodeURIComponent(req.url.split('?')[0]).replace(/\/$/, '/index.html'));
+  if (!p.startsWith(ROOT) || !fs.existsSync(p) || fs.statSync(p).isDirectory()) { res.writeHead(404); return res.end(); }
+  res.writeHead(200, { 'content-type': TYPES[path.extname(p)] || 'application/octet-stream' });
+  fs.createReadStream(p).pipe(res);
+});
+let URL = '';
 const DOCS = path.resolve(__dirname, '..', 'docs');
 const SHOTS = process.argv.includes('--shots');
 
@@ -35,7 +46,7 @@ function freezeClock() {
 }
 
 async function newPage(browser, opts) {
-  const ctx = await browser.newContext(Object.assign({ locale: 'en-IN', timezoneId: 'Asia/Kolkata' }, opts));
+  const ctx = await browser.newContext(Object.assign({ locale: 'en-IN', timezoneId: 'Asia/Kolkata', serviceWorkers: 'block' }, opts));
   await ctx.addInitScript(freezeClock);
   return { ctx, page: await ctx.newPage() };
 }
@@ -63,6 +74,8 @@ async function screenshots(browser) {
 }
 
 (async () => {
+  await new Promise((r) => server.listen(0, r));
+  URL = 'http://localhost:' + server.address().port + '/index.html';
   const browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {});
   const { ctx, page } = await newPage(browser, { viewport: { width: 1100, height: 900 }, colorScheme: 'light' });
   const errors = [];
@@ -205,7 +218,7 @@ async function screenshots(browser) {
   await ctx.close();
 
   if (SHOTS) await screenshots(browser);
-  await browser.close();
+  await browser.close(); server.close();
 
   console.log('\nerrors:', errors.length ? errors : 'none');
   if (errors.length) fail += errors.length;

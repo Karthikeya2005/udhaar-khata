@@ -23,6 +23,8 @@ It's a static web app (plain HTML, CSS and JavaScript, no build step) and instal
 - **Recurring payments**: rent, hostel, subscriptions, recharge. You confirm each one; nothing is posted automatically.
 - **Net worth**: cash + bank + money owed to you − money you owe.
 - **Backup and security**: PIN lock and encrypted backup files.
+- **Cloud sync (beta, optional)**: sign in with Google and keep the same ledger on every device. Entries are locked with your own passphrase before upload. See [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md).
+- **CSV export** of loans and transactions (Settings → Export CSV).
 
 ## How the numbers work
 
@@ -60,23 +62,25 @@ Want a real `.apk`? Paste your Pages URL into [PWABuilder](https://www.pwabuilde
 
 ## Data and privacy
 
-- All data is stored in your browser's `localStorage` (key `udhaar-khata.v2`) on your device. There is no server and no account.
+- By default all data is stored in your browser's `localStorage` (key `udhaar-khata.v2`) on your device. There is no server and no account.
+- If you turn on cloud sync, entries are encrypted on your device (AES-GCM) and stored in your own Firebase project, readable only by your Google account. Without your passphrase they cannot be read.
 - The PIN is hashed with PBKDF2. Backup files are encrypted with AES-GCM using a password you choose.
-- The only network request is Google Fonts.
+- Network requests: Google Fonts, plus Firebase only when cloud sync is configured.
 
 ## Limits (honest ones)
 
 - No push notifications. Reminders show when you open the app.
 - No fingerprint/face unlock. The PIN is a screen lock, not encryption of the stored data.
 - Data lives in one browser on one device. **Back up regularly** (Settings → Back up); clearing site data erases it.
-- No sync between devices.
+- Sync needs your own free Firebase project. Until you set one up, there is no sync between devices.
+- If you forget your sync passphrase, the cloud copy cannot be recovered. Keep a backup file.
 
 ## Tests
 
 ```bash
 npm install
 npx playwright install chromium
-npm test           # end-to-end checks with a frozen clock
+npm test           # end-to-end checks plus a mock-cloud sync test (no Firebase account needed)
 npm run shots      # also regenerates docs/ screenshots
 ```
 
@@ -89,9 +93,13 @@ index.html              app shell
 styles.css              styles (light and dark)
 app.js                  all logic and views
 sw.js                   offline service worker
+sync.js                 Firebase adapter (optional)
+firebase-config.js      your Firebase web config (empty = local only)
+firestore.rules         security rules to publish in Firebase
 manifest.webmanifest    PWA manifest
 icons/                  app icons
 tests/e2e.js            Playwright end-to-end tests
+tests/sync.js           cloud sync tests against a mock backend
 docs/                   screenshots
 .github/workflows/      CI
 ```
@@ -100,10 +108,9 @@ docs/                   screenshots
 
 - Parse UPI/bank SMS into transactions
 - Repayment-likelihood score per friend
-- Optional sync backend
-- CSV export
+- Live collaboration on shared expenses
+- Push reminders (Firebase Cloud Messaging)
 
 ## Licence
 
 MIT, see [LICENSE](LICENSE).
-k
