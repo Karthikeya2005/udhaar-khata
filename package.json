@@ -6,7 +6,7 @@
   "scripts": {
     "start": "npx --yes serve .",
     "test": "node tests/e2e.js && node tests/sync.js",
-    "shots": "node tests/e2e.js --shots"
+    "shots": "node tests/shots.js"
   },
   "devDependencies": {
     "playwright": "^1.56.0"
